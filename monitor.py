@@ -1,109 +1,101 @@
-
-import json
-import os
 import requests
 from bs4 import BeautifulSoup
+import hashlib
+import json
+import os
+import time
 
 URL = "https://ebg-muenchen-west.de/wohnungsangebote/"
+STATE_FILE = "state.json"
 
-STATE_FILE = "known_listings.json"
-
-BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-
-
-def send_message(message):
-    requests.post(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        data={
-            "chat_id": CHAT_ID,
-            "text": message,
-            "disable_web_page_preview": False
-        },
-        timeout=30
-    )
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 
-def load_known():
+def send_telegram(message: str):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Telegram nicht konfiguriert:")
+        print(message)
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    requests.post(url, data={
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "disable_web_page_preview": False
+    })
+
+
+def load_state():
     if not os.path.exists(STATE_FILE):
-        return []
+        return set()
 
     with open(STATE_FILE, "r") as f:
-        return json.load(f)
+        return set(json.load(f))
 
 
-def save_known(data):
+def save_state(state):
     with open(STATE_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+        json.dump(list(state), f)
 
 
-def get_listings():
+def fetch_listings():
+    r = requests.get(URL, timeout=30)
+    r.raise_for_status()
 
-    response = requests.get(URL, timeout=30)
-    response.raise_for_status()
-
-    soup = BeautifulSoup(response.text, "html.parser")
+    soup = BeautifulSoup(r.text, "lxml")
 
     listings = []
 
-    # Alle Links durchsuchen
+    # Heuristik: alle Links + Texte
     for a in soup.find_all("a", href=True):
-
+        text = a.get_text(" ", strip=True)
         href = a["href"]
 
-        if "/properties/" in href or "/wohnungsangebote/" in href:
+        if not text:
+            continue
 
-            title = a.get_text(" ", strip=True)
+        # grobe Filterung (wir verfeinern das später wenn nötig)
+        if "wohnung" in text.lower() or "miete" in text.lower() or "/wohnungsangebote/" in href:
+            key = hashlib.sha256((text + href).encode()).hexdigest()
 
-            if title:
-                listings.append({
-                    "title": title,
-                    "url": href
-                })
+            listings.append({
+                "key": key,
+                "text": text,
+                "url": href
+            })
 
-    # doppelte entfernen
-    unique = []
+    return listings
 
-    seen = set()
 
-    for item in listings:
-        if item["url"] not in seen:
-            unique.append(item)
-            seen.add(item["url"])
+def format_message(item):
+    return f"""🏠 Neue Wohnungsanzeige
 
-    return unique
+{item['text']}
+
+🔗 {item['url']}
+"""
 
 
 def main():
+    print("Prüfe Seite...")
 
-    listings = get_listings()
+    state = load_state()
+    listings = fetch_listings()
 
-    known = load_known()
+    new_items = [x for x in listings if x["key"] not in state]
 
-    known_urls = {x["url"] for x in known}
+    if not new_items:
+        print("Keine neuen Wohnungen.")
+        return
 
-    new = [x for x in listings if x["url"] not in known_urls]
+    print(f"{len(new_items)} neue Einträge gefunden.")
 
-    if new:
+    for item in new_items:
+        send_telegram(format_message(item))
+        state.add(item["key"])
 
-        for apartment in new:
-
-            send_message(
-                f"""🏠 Neue Wohnung gefunden!
-
-{apartment['title']}
-
-{apartment['url']}
-"""
-            )
-
-        save_known(listings)
-
-    elif not known:
-        save_known(listings)
-        print("Erster Lauf.")
-    else:
-        print("Keine neue Wohnung.")
+    save_state(state)
 
 
 if __name__ == "__main__":
